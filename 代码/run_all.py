@@ -3,10 +3,10 @@
 run_all.py —— 运行所有问题并生成完整结果
 ============================================
 按顺序执行：
-  1. relay_site.py - 预处理中继候选点
-  2. q1.py - 问题一：单点往返与组批
-  3. q2.py - 问题二：多点多架次调度
-  4. q3.py - 问题三：通信约束下联合调度
+  1. q1.py - 问题一：单点往返与组批
+  2. q2.py - 问题二：多点多架次调度
+  3. comm_geo.py - 预处理：航段直连盲区采样 + 候选中继点覆盖矩阵（约 2 分钟，结果缓存）
+  4. q3.py - 问题三：通信约束下联合调度（约 10 分钟）
   5. q4.py - 问题四：任务分区与资源配置
 """
 import os
@@ -29,7 +29,7 @@ def run_script(script_name, description):
             cwd=os.path.dirname(os.path.abspath(__file__)),
             capture_output=True,
             text=True,
-            timeout=600  # 10分钟超时
+            timeout=3600
         )
         
         elapsed = time.time() - start_time
@@ -49,7 +49,7 @@ def run_script(script_name, description):
             return False
             
     except subprocess.TimeoutExpired:
-        print(f"\n✗ {description} 超时（>10分钟）")
+        print(f"\n✗ {description} 超时（>60分钟）")
         return False
     except Exception as e:
         print(f"\n✗ {description} 出现异常：{e}")
@@ -66,11 +66,12 @@ if __name__ == "__main__":
     overall_start = time.time()
     
     tasks = [
-        ("relay_site.py", "预处理：中继候选点分析"),
         ("q1.py", "问题一：单点往返运输能力与货箱组批"),
         ("q2.py", "问题二：异构无人机多点多架次运输调度"),
+        ("comm_geo.py", "预处理：通信盲区与中继候选点覆盖"),
         ("q3.py", "问题三：通信约束下的运输与中继联合调度"),
-        ("q4.py", "问题四：救援任务分区与资源配置优化")
+        ("q4.py", "问题四：救援任务分区与资源配置优化"),
+        ("fill_template.py", "按模板汇总提交结果")
     ]
     
     results = {}
@@ -79,9 +80,7 @@ if __name__ == "__main__":
         success = run_script(script, desc)
         results[desc] = "成功" if success else "失败"
         
-        if not success and script == "relay_site.py":
-            print("\n警告：预处理失败可能影响问题三，将继续执行...")
-        elif not success:
+        if not success:
             print(f"\n警告：{desc} 失败，将继续执行后续问题...")
     
     # 总结
@@ -101,7 +100,7 @@ if __name__ == "__main__":
     print("  - 结果/Q2_结果.xlsx")
     print("  - 结果/Q3_结果.xlsx")
     print("  - 结果/Q4_结果.xlsx")
-    print("  - 结果/Q4_分析报告.txt")
+    print("  - 结果/结果提交.xlsx（按模板汇总 Q1~Q4）")
     print("  - 结果/图/*.png")
     
     print(f"\n完成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}")
