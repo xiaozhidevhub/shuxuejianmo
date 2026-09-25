@@ -1,906 +1,509 @@
 # -*- coding: utf-8 -*-
 """
-q4.py —— 问题四：救援任务分区与资源配置优化方案
-==========================================================
-核心思路：
-  1. 从问题三的联合调度方案出发，保持货箱组批、访问顺序、通信保障关系不变
-  2. 约束条件：同一运输架次涉及的所有服务区必须在同一任务组
-  3. 分区目标：
-     - 最小化资源配置规模（各组所需总资源数）
-     - 平衡组间工作量（能耗、架次数、完成时间）
-     - 减少与现有库存的资源缺口
-     - 降低资源冗余（避免过度分配）
-  
-  4. 求解算法：
-     分2组：图分割算法 + 模拟退火优化
-       - 构建"服务区依赖图"（同一架次的服务区连边）
-       - 用谱分割初始化，再用退火优化平衡性
-     分3组：K-means聚类 + 约束修正 + 退火优化
-       - 基于地理位置和工作量特征聚类
-       - 修正违反"同架次同组"约束的分配
-       - 退火优化资源配置和平衡性
-  
-  5. 资源需求计算：
-     - 每组独立计算所需的运输无人机、电池、中继无人机、能源组件数量
-     - 考虑时间重叠：同一时刻需要多少资源同时工作
-     - 与现有库存对比，计算资源缺口
-
-输出内容：
-  - 2组和3组的分区方案及资源配置表
-  - 各组工作量对比（架次数、能耗、完成时间）
-  - 资源配置规模对比
-  - 资源缺口分析
-  - 可视化：分区地图、资源甘特图、工作量对比图
+q4.py —— 问题四：救援任务分区与资源配置优化
+=============================================
+【输入】问题三的联合调度方案（结果/q3_best.pkl）：运输架次（组批、访问顺序、时刻、机型）、
+        中继架次（点位、时段、实体、组件）以及逐段“运输架次 ↔ 中继架次”的通信保障关系。
+【规则】分区时上述安排全部保持不变；同一运输架次访问的多个服务区必须同组；
+        各组只承担本组服务区的运输任务及为这些任务提供保障的中继任务，资源不得跨组调配。
+【建模】
+ 1. 服务区“块”：以多点架次为边做并查集，连通分量为不可拆分的块 → 分区 = 块的集合划分。
+ 2. 组资源需求：任务时刻固定时，某类资源的最少数量 = 该组任务占用区间的最大重叠数
+    （区间图着色数 = 最大团，按开始时刻贪心分配即可达到，属于精确值）：
+      运输无人机 [开始, 返回)、共享电池 [开始, 充满)、中继无人机 [起飞, 返回+周转300s)、能源组件 [起飞, 充满)。
+ 3. 中继任务归属：若某中继架次同时保障了两个组的运输架次，则两组各自需要一份该中继任务
+    （口径A：原中继架次整体复制，时段完全不变——主口径；
+      口径B：各组副本的服务窗口收缩到本组实际使用区间，点位与保障关系不变——用于分析冗余来源）。
+ 4. 评价指标：资源配置规模（各组资源之和）、资源冗余（相对不分区的增加量）、
+    组间工作量均衡（各组无人机作业时长的变异系数 CV、最大/最小比）、与库存的资源缺口。
+ 5. 求解：块数不多，对 2 组、3 组的全部划分（第二类 Stirling 数）穷举 → 全局最优，无启发式误差。
+    多目标处理用 ε-约束法：先要求组间工作量 CV ≤ ε（推荐 ε=0.2，即最大/最小约 1.4 倍以内，
+    保证各组是“规模相当的独立执行单元”），再按“资源缺口 → 资源规模 → CV”字典序取最优；
+    同时给出两个极端（只省资源 / 只求均衡）与完整的 ε-权衡曲线、帕累托前沿。
 """
+import os
 import pickle
-import random
+import itertools
 import numpy as np
 import pandas as pd
-import networkx as nx
-from sklearn.cluster import KMeans
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from collections import defaultdict
-import vrp
 from common import *
 
-plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei"]
+plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "WenQuanYi Micro Hei", "Droid Sans Fallback"]
 plt.rcParams["axes.unicode_minus"] = False
 
+with open(os.path.join(RESULT_DIR, "q3_best.pkl"), "rb") as f:
+    Q3 = pickle.load(f)
+TRIPS = Q3["trips"]
+RELAYS = {r["rid"]: r for r in Q3["relays"]}
+SITES = {s["name"]: s for s in Q3["sites"]}
+P_SERVE = RELAY["P_hover"] + RELAY["P_comm"]
 
-# ========== 第一部分：服务区依赖图构建 ==========
+STOCK = {"U_A": 0, "U_B": 0, "U_C": 0}
+for _, g in DRONES:
+    STOCK[f"U_{g}"] += 1
+STOCK.update({f"B_{g}": BATTERIES[g]["count"] for g in "ABC"})
+STOCK.update({"R": len(RELAY_IDS), "M": MODULES["count"]})
+RES_KEYS = ["U_A", "U_B", "U_C", "B_A", "B_B", "B_C", "R", "M"]
+RES_NAME = {"U_A": "A型运输无人机", "U_B": "B型运输无人机", "U_C": "C型运输无人机",
+            "B_A": "A型电池组", "B_B": "B型电池组", "B_C": "C型电池组", "R": "中继无人机", "M": "中继能源组件"}
 
-def build_dependency_graph(plan):
-    """
-    构建服务区依赖图：同一架次访问的服务区之间连边（必须在同一组）
-    返回：networkx图对象，节点=服务区，边=依赖关系
-    """
-    G = nx.Graph()
-    
-    # 添加所有服务区节点
+# 每个运输架次使用了哪些中继架次、各自的使用区间
+USAGE = {}
+for t in TRIPS:
+    u = {}
+    for a, b, lab, m in t["comm"]:
+        if m not in ("直连", "中断"):
+            lo, hi = u.get(m, (a, b))
+            u[m] = (min(lo, a), max(hi, b))
+    USAGE[t["tid"]] = u
+
+
+# ---------------------------------------------------------------
+# 1. 服务区块（同一架次的服务区必须同组）
+# ---------------------------------------------------------------
+def area_blocks():
+    parent = {s: s for s in AREAS}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    for t in TRIPS:
+        for a, b in zip(t["areas"], t["areas"][1:]):
+            parent[find(a)] = find(b)
+    blocks = {}
     for s in AREAS:
-        G.add_node(s)
-    
-    # 添加依赖边（同一架次的服务区）
-    for p in plan:
-        stops = [s for s, _ in p["ev"]["stops"]]
-        if len(stops) > 1:
-            # 完全图：任意两个服务区都相连
-            for i in range(len(stops)):
-                for j in range(i + 1, len(stops)):
-                    if G.has_edge(stops[i], stops[j]):
-                        G[stops[i]][stops[j]]["weight"] += 1  # 多次共同访问，加强连接
-                    else:
-                        G.add_edge(stops[i], stops[j], weight=1)
-    
-    return G
+        blocks.setdefault(find(s), []).append(s)
+    return sorted((sorted(v) for v in blocks.values()), key=lambda v: v[0])
 
 
-# ========== 第二部分：初始分区算法 ==========
-
-def initial_partition_2(G, plan):
-    """
-    初始2分区：谱分割算法
-    - 计算图拉普拉斯矩阵的第二小特征向量（Fiedler向量）
-    - 按特征向量值的符号分成两组
-    - 修正违反约束的分配
-    """
-    if G.number_of_edges() == 0:
-        # 没有依赖关系，按地理位置分
-        lons = [NODES[s]["lon"] for s in AREAS]
-        median_lon = np.median(lons)
-        return {s: 0 if NODES[s]["lon"] < median_lon else 1 for s in AREAS}
-    
-    # 谱分割
-    try:
-        parts = nx.algorithms.community.kernighan_lin_bisection(G, weight="weight")
-        partition = {}
-        for idx, part in enumerate(parts):
-            for s in part:
-                partition[s] = idx
-    except:
-        # 降级方案：按地理位置
-        lons = [NODES[s]["lon"] for s in AREAS]
-        median_lon = np.median(lons)
-        partition = {s: 0 if NODES[s]["lon"] < median_lon else 1 for s in AREAS}
-    
-    # 确保未分配的服务区也加入
-    for s in AREAS:
-        if s not in partition:
-            partition[s] = 0
-    
-    return partition
+BLOCKS = area_blocks()
+AREA_BLOCK = {s: k for k, blk in enumerate(BLOCKS) for s in blk}
+TRIP_BLOCK = {t["tid"]: AREA_BLOCK[t["areas"][0]] for t in TRIPS}
 
 
-def initial_partition_3(plan):
-    """
-    初始3分区：K-means聚类 + 约束修正
-    特征：地理位置（经纬度）+ 工作量（该服务区被访问的总次数）
-    """
-    # 统计每个服务区的工作量
-    workload = defaultdict(int)
-    for p in plan:
-        for s, _ in p["ev"]["stops"]:
-            workload[s] += 1
-    
-    # 构建特征矩阵
-    features = []
-    area_list = []
-    for s in AREAS:
-        lon, lat = NODES[s]["lon"], NODES[s]["lat"]
-        wl = workload.get(s, 0)
-        features.append([lon * 100, lat * 100, wl * 10])  # 缩放到相近量级
-        area_list.append(s)
-    
-    features = np.array(features)
-    
-    # K-means聚类
-    kmeans = KMeans(n_clusters=3, random_state=42, n_init=20)
-    labels = kmeans.fit_predict(features)
-    
-    partition = {area_list[i]: int(labels[i]) for i in range(len(area_list))}
-    
-    return partition
+# ---------------------------------------------------------------
+# 2. 资源需求：区间最大重叠数（并给出一个达到该下界的具体分配）
+# ---------------------------------------------------------------
+def max_overlap(intervals):
+    ev = []
+    for a, b in intervals:
+        ev.append((a, 1)); ev.append((b, -1))
+    ev.sort(key=lambda x: (x[0], x[1]))              # 同一时刻先释放再占用
+    cur = best = 0
+    for _, d in ev:
+        cur += d
+        best = max(best, cur)
+    return best
 
 
-def fix_partition_constraints(partition, plan):
-    """
-    修正分区，确保同一架次的服务区在同一组
-    策略：如果一个架次跨组，把所有服务区移到出现次数最多的组
-    """
-    changed = True
-    max_iter = 20
-    iter_count = 0
-    
-    while changed and iter_count < max_iter:
-        changed = False
-        iter_count += 1
-        
-        for p in plan:
-            stops = [s for s, _ in p["ev"]["stops"]]
-            if len(stops) <= 1:
-                continue
-            
-            # 统计这些服务区所在的组
-            groups = [partition[s] for s in stops]
-            if len(set(groups)) > 1:
-                # 跨组了，需要修正
-                # 策略：移到出现最多的组
-                target_group = max(set(groups), key=groups.count)
-                for s in stops:
-                    if partition[s] != target_group:
-                        partition[s] = target_group
-                        changed = True
-    
-    return partition
-
-
-# ========== 第三部分：分区评估与资源需求计算 ==========
-
-def calculate_group_resources(group_plan, group_relay):
-    """
-    计算一个任务组需要的资源数量
-    原理：找出同一时刻最多需要多少资源同时工作
-    """
-    # 运输无人机和电池：按机型分别统计
-    uav_need = {"A": 0, "B": 0, "C": 0}
-    batt_need = {"A": 0, "B": 0, "C": 0}
-    
-    for g in ["A", "B", "C"]:
-        # 该机型的所有架次
-        trips = [p for p in group_plan if p["ev"]["g"] == g]
-        if not trips:
-            continue
-        
-        # 找出最繁忙时刻需要多少无人机
-        events = []
-        for p in trips:
-            events.append((p["start"], 1))    # 起飞
-            events.append((p["end"], -1))     # 返回
-        events.sort()
-        
-        max_concurrent = 0
-        current = 0
-        for t, delta in events:
-            current += delta
-            max_concurrent = max(max_concurrent, current)
-        uav_need[g] = max_concurrent
-        
-        # 电池需求：找最繁忙时刻需要多少块电池（占用+充电）
-        events = []
-        for p in trips:
-            events.append((p["start"], 1))
-            events.append((p["charge_end"], -1))
-        events.sort()
-        
-        max_concurrent = 0
-        current = 0
-        for t, delta in events:
-            current += delta
-            max_concurrent = max(max_concurrent, current)
-        batt_need[g] = max_concurrent
-    
-    # 中继无人机和能源组件
-    relay_uav_need = 0
-    module_need = 0
-    
-    if group_relay and group_relay["sorties"]:
-        # 中继无人机需求
-        events = []
-        for rs in group_relay["sorties"]:
-            events.append((rs["start"], 1))
-            events.append((rs["ret"], -1))
-        events.sort()
-        
-        max_concurrent = 0
-        current = 0
-        for t, delta in events:
-            current += delta
-            max_concurrent = max(max_concurrent, current)
-        relay_uav_need = max_concurrent
-        
-        # 能源组件需求
-        events = []
-        for rs in group_relay["sorties"]:
-            events.append((rs["start"], 1))
-            events.append((rs["charge_end"], -1))
-        events.sort()
-        
-        max_concurrent = 0
-        current = 0
-        for t, delta in events:
-            current += delta
-            max_concurrent = max(max_concurrent, current)
-        module_need = max_concurrent
-    
-    return {
-        "uav": uav_need,
-        "batt": batt_need,
-        "relay_uav": relay_uav_need,
-        "module": module_need,
-        "total_uav": sum(uav_need.values()),
-        "total_batt": sum(batt_need.values())
-    }
-
-
-def evaluate_partition(partition, plan, relay_info):
-    """
-    评估一个分区方案的质量
-    返回：各组的工作量、资源需求、平衡性指标
-    """
-    n_groups = len(set(partition.values()))
-    groups = {i: {"areas": [], "plan": [], "relay": []} for i in range(n_groups)}
-    
-    # 按分区分配服务区
-    for s, g in partition.items():
-        groups[g]["areas"].append(s)
-    
-    # 按分区分配运输架次
-    for p in plan:
-        stops = [s for s, _ in p["ev"]["stops"]]
-        g = partition[stops[0]]  # 同一架次的服务区必然在同一组
-        groups[g]["plan"].append(p)
-    
-    # 按分区分配中继架次
-    if relay_info and relay_info["sorties"]:
-        for rs in relay_info["sorties"]:
-            # 判断这个中继架次服务的是哪个组
-            # 简化：看它覆盖的服务区属于哪个组
-            site = rs["site"]
-            # 找出这个中继点覆盖的服务区
-            covered_areas = []
-            for s in groups[0]["areas"] + groups[1]["areas"] + (groups[2]["areas"] if n_groups > 2 else []):
-                # 简化判断：如果距离<10km，认为可能覆盖
-                if hdist(site[0], site[1], NODES[s]["lon"], NODES[s]["lat"]) < 10000:
-                    covered_areas.append(s)
-            
-            if covered_areas:
-                g = partition[covered_areas[0]]
-                groups[g]["relay"].append(rs)
-    
-    # 计算各组工作量和资源需求
-    results = {}
-    for i in range(n_groups):
-        gr = groups[i]
-        
-        # 工作量指标
-        n_trips = len(gr["plan"])
-        n_relay = len(gr["relay"])
-        energy = sum(p["ev"]["E"] for p in gr["plan"])
-        relay_energy = sum(rs["energy"] for rs in gr["relay"])
-        makespan = max((p["end"] for p in gr["plan"]), default=0)
-        relay_makespan = max((rs["ret"] for rs in gr["relay"]), default=0)
-        
-        # 资源需求
-        relay_dict = {"sorties": gr["relay"], "energy": relay_energy}
-        resources = calculate_group_resources(gr["plan"], relay_dict)
-        
-        results[i] = {
-            "areas": gr["areas"],
-            "n_areas": len(gr["areas"]),
-            "n_trips": n_trips,
-            "n_relay": n_relay,
-            "energy": energy,
-            "relay_energy": relay_energy,
-            "makespan": makespan,
-            "relay_makespan": relay_makespan,
-            "resources": resources
-        }
-    
-    # 计算平衡性（标准差越小越平衡）
-    workloads = [results[i]["n_trips"] + results[i]["n_relay"] for i in range(n_groups)]
-    energies = [results[i]["energy"] + results[i]["relay_energy"] for i in range(n_groups)]
-    
-    balance_score = np.std(workloads) + np.std(energies) / 10.0
-    
-    # 资源总需求
-    total_resources = sum(results[i]["resources"]["total_uav"] for i in range(n_groups))
-    total_resources += sum(results[i]["resources"]["total_batt"] for i in range(n_groups))
-    total_resources += sum(results[i]["resources"]["relay_uav"] for i in range(n_groups))
-    total_resources += sum(results[i]["resources"]["module"] for i in range(n_groups))
-    
-    return results, balance_score, total_resources
-
-
-# ========== 第四部分：分区优化算法 ==========
-
-def partition_neighbor(partition, plan):
-    """
-    分区邻域操作：
-    1. 随机选一个服务区，移到另一个组
-    2. 随机选两个服务区，交换它们的组
-    确保满足约束（同架次同组）
-    """
-    partition = dict(partition)
-    n_groups = len(set(partition.values()))
-    
-    if random.random() < 0.5:
-        # 操作1：移动一个服务区
-        s = random.choice(AREAS)
-        new_g = random.randint(0, n_groups - 1)
-        partition[s] = new_g
-    else:
-        # 操作2：交换两个服务区的组
-        s1, s2 = random.sample(AREAS, 2)
-        partition[s1], partition[s2] = partition[s2], partition[s1]
-    
-    # 修正约束
-    partition = fix_partition_constraints(partition, plan)
-    
-    # 检查是否有空组
-    used_groups = set(partition.values())
-    if len(used_groups) < n_groups:
-        return None  # 产生了空组，拒绝
-    
-    return partition
-
-
-def optimize_partition(init_partition, plan, relay_info, iters=10000, target="balance"):
-    """
-    用模拟退火优化分区方案
-    target: "balance"=平衡性优先, "resource"=资源总量优先
-    """
-    random.seed(42)
-    
-    def evaluate(part):
-        results, balance, total_res = evaluate_partition(part, plan, relay_info)
-        if target == "balance":
-            return balance + total_res * 0.1
+def interval_assign(items):
+    """items = [(名称, 开始, 结束)]，按开始时刻贪心分配到最早空闲的资源，返回 {名称: 资源序号}"""
+    free = []
+    out = {}
+    for name, a, b in sorted(items, key=lambda x: (x[1], x[2])):
+        k = next((i for i, f in enumerate(free) if f <= a + 1e-6), None)
+        if k is None:
+            free.append(b); k = len(free) - 1
         else:
-            return total_res + balance * 0.5
-    
-    cur = init_partition
-    cur_cost = evaluate(cur)
-    best, best_cost = dict(cur), cur_cost
-    
-    T0, T_end = 3.0, 0.01
-    for it in range(iters):
-        T = T0 * (T_end / T0) ** (it / iters)
-        
-        cand = partition_neighbor(cur, plan)
-        if cand is None:
+            free[k] = b
+        out[name] = k + 1
+    return out
+
+
+def relay_copy(rid, tids, mode):
+    """某组对中继架次 rid 的需求副本；mode='A' 整体复制，'B' 收缩到本组使用区间"""
+    r = RELAYS[rid]
+    if mode == "A":
+        return dict(r)
+    lo = min(USAGE[t][rid][0] for t in tids)
+    hi = max(USAGE[t][rid][1] for t in tids)
+    ws, we = max(r["ws"], lo), min(r["we"], hi)
+    si = SITES[r["site"]]
+    e = si["e_fix"] + P_SERVE * (we - ws) / 3600.0
+    soc = 1 - e / RELAY["E"]
+    ret = we + si["t_back"]
+    return {**r, "ws": ws, "we": we, "launch": ws - si["lead"], "ret": ret, "E": e, "soc": soc,
+            "charge_end": ret + charge_time(soc, MODULES["full"])}
+
+
+def group_detail(trips, mode="A"):
+    """一组任务（运输架次列表）的资源需求与工作量"""
+    need = {}
+    for g in "ABC":
+        ts = [t for t in trips if t["g"] == g]
+        need[f"U_{g}"] = max_overlap([(t["start"], t["end"]) for t in ts])
+        need[f"B_{g}"] = max_overlap([(t["start"], t["charge_end"]) for t in ts])
+    serve = {}
+    for t in trips:
+        for rid in USAGE[t["tid"]]:
+            serve.setdefault(rid, []).append(t["tid"])
+    rel = [relay_copy(rid, tids, mode) for rid, tids in sorted(serve.items())]
+    need["R"] = max_overlap([(r["launch"], r["ret"] + RELAY["turn"]) for r in rel])
+    need["M"] = max_overlap([(r["launch"], r["charge_end"]) for r in rel])
+    work_t = sum(t["end"] - t["start"] for t in trips)
+    work_r = sum(r["ret"] - r["launch"] for r in rel)
+    return {"need": need, "relays": rel, "serve": serve, "n_trips": len(trips), "n_relay": len(rel),
+            "E_t": sum(t["E"] for t in trips), "E_r": sum(r["E"] for r in rel),
+            "work_t": work_t, "work_r": work_r, "work": work_t + work_r,
+            "makespan": max([t["end"] for t in trips] + [r["ret"] for r in rel]),
+            "n_box": sum(t["n_box"] for t in trips)}
+
+
+def trips_of(blocks_in_group):
+    return [t for t in TRIPS if TRIP_BLOCK[t["tid"]] in blocks_in_group]
+
+
+BASE = group_detail(TRIPS, "A")                      # 不分区时（问题三原方案）的资源需求
+
+
+def evaluate_partition(labels, K, mode="A"):
+    """labels[k] = 第 k 个块所属任务组（0..K-1）"""
+    groups = []
+    for g in range(K):
+        blks = {k for k, l in enumerate(labels) if l == g}
+        groups.append({"blocks": blks, "areas": sorted(s for k in blks for s in BLOCKS[k]),
+                       **group_detail(trips_of(blks), mode)})
+    total = {k: sum(gr["need"][k] for gr in groups) for k in RES_KEYS}
+    gap = {k: max(0, total[k] - STOCK[k]) for k in RES_KEYS}
+    redund = {k: total[k] - BASE["need"][k] for k in RES_KEYS}
+    work = np.array([gr["work"] for gr in groups])
+    cv = float(work.std() / work.mean()) if work.mean() > 0 else 0.0
+    return {"labels": tuple(labels), "groups": groups, "total": total, "gap": gap, "redund": redund,
+            "gap_sum": sum(gap.values()), "res_sum": sum(total.values()), "red_sum": sum(redund.values()),
+            "cv": cv, "ratio": float(work.max() / max(work.min(), 1e-9)),
+            "ms_spread": max(gr["makespan"] for gr in groups) - min(gr["makespan"] for gr in groups)}
+
+
+def partitions(n, K):
+    """n 个块划分为恰好 K 个非空组的全部方案（限制增长串，组编号无重复计数）"""
+    def rec(i, labels, m):
+        if i == n:
+            if m == K:
+                yield list(labels)
+            return
+        for g in range(min(m + 1, K)):
+            if n - i - 1 < K - max(m, g + 1):
+                continue
+            labels.append(g)
+            yield from rec(i + 1, labels, max(m, g + 1))
+            labels.pop()
+    yield from rec(0, [], 0)
+
+
+CV_MAX = 0.20                                       # ε-约束：组间工作量变异系数上限
+EPS_LIST = (0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.60, float("inf"))
+
+
+def lex_key(r):
+    return (r["gap_sum"], r["res_sum"], round(r["cv"], 6), r["ms_spread"])
+
+
+def best_under(rs, eps):
+    ok = [r for r in rs if r["cv"] <= eps + 1e-12]
+    return min(ok, key=lex_key) if ok else None
+
+
+def pareto(results):
+    """在（资源缺口, 资源规模, 工作量CV）三目标下的非支配解"""
+    pts = [(r["gap_sum"], r["res_sum"], r["cv"]) for r in results]
+    front = []
+    for i, p in enumerate(pts):
+        if not any(all(q[k] <= p[k] for k in range(3)) and any(q[k] < p[k] for k in range(3))
+                   for j, q in enumerate(pts) if j != i):
+            front.append(results[i])
+    return front
+
+
+# ---------------------------------------------------------------
+# 3. 输出
+# ---------------------------------------------------------------
+def config_rows(K, res):
+    rows = []
+    for g, gr in enumerate(res["groups"], 1):
+        n = gr["need"]
+        rows.append({"K（2或3）": K, "任务组编号": f"G{g}", "服务区列表": ",".join(gr["areas"]),
+                     "A型运输无人机数": n["U_A"], "B型运输无人机数": n["U_B"], "C型运输无人机数": n["U_C"],
+                     "A型电池组数": n["B_A"], "B型电池组数": n["B_B"], "C型电池组数": n["B_C"],
+                     "中继无人机数": n["R"], "中继能源组件数": n["M"]})
+    return rows
+
+
+def workload_rows(K, res):
+    rows = []
+    for g, gr in enumerate(res["groups"], 1):
+        rows.append({"K": K, "任务组": f"G{g}", "服务区数": len(gr["areas"]), "货箱数": gr["n_box"],
+                     "运输架次": gr["n_trips"], "中继架次（含复制）": gr["n_relay"],
+                     "运输能耗(kWh)": round(gr["E_t"], 3), "中继能耗(kWh)": round(gr["E_r"], 3),
+                     "运输作业时长(s)": round(gr["work_t"], 1), "中继作业时长(s)": round(gr["work_r"], 1),
+                     "总作业时长(s)": round(gr["work"], 1), "组完成时刻(s)": round(gr["makespan"], 1),
+                     "资源总数": sum(gr["need"].values()),
+                     "运输架次列表": ",".join(t["tid"] for t in trips_of(gr["blocks"])),
+                     "依托中继架次": ",".join(sorted(gr["serve"]))})
+    return rows
+
+
+def compare_rows(K, res, name):
+    row = {"方案": name, "K": K, "资源配置总数": res["res_sum"], "资源冗余(相对不分区)": res["red_sum"],
+           "资源缺口合计": res["gap_sum"], "工作量CV": round(res["cv"], 4), "工作量最大/最小": round(res["ratio"], 3),
+           "组完成时刻极差(s)": round(res["ms_spread"], 1)}
+    for k in RES_KEYS:
+        row[f"{RES_NAME[k]}(需求/库存)"] = f"{res['total'][k]}/{STOCK[k]}"
+    return row
+
+
+def gap_reasons(K, res):
+    """逐类资源解释缺口/冗余的来源：找出各组峰值时段，以及被多组复制的中继架次"""
+    rows = []
+    groups = res["groups"]
+    shared = {}
+    for g, gr in enumerate(groups, 1):
+        for rid in gr["serve"]:
+            shared.setdefault(rid, []).append(f"G{g}")
+    for k in RES_KEYS:
+        if res["total"][k] <= BASE["need"][k] and res["gap"][k] == 0:
             continue
-        
-        c = evaluate(cand)
-        if c < cur_cost or random.random() < np.exp(-(c - cur_cost) / T):
-            cur, cur_cost = cand, c
-            if c < best_cost:
-                best, best_cost = dict(cand), c
-        
-        if it % 2000 == 0 and it > 0:
-            print(f"    分区优化 {it:5d}  温度 {T:6.3f}  当前 {cur_cost:8.2f}  最优 {best_cost:8.2f}")
-    
-    return best, best_cost
+        parts = []
+        for g, gr in enumerate(groups, 1):
+            n = gr["need"][k]
+            if n == 0:
+                continue
+            parts.append(f"G{g}需{n}")
+        why = []
+        if k in ("R", "M"):
+            dup = [f"{rid}({'/'.join(v)})" for rid, v in shared.items() if len(v) > 1]
+            if dup:
+                why.append("同一中继架次同时保障多个组的运输架次，分区后需各组独立派出：" + "、".join(dup))
+            why.append("不同组的中继任务时段重叠，无法再由同一中继实体/组件先后执行")
+        else:
+            why.append("各组的高峰时段相互重叠，不分区时可错峰共用的无人机/电池被“锁定”在各自组内")
+            if k.startswith("B"):
+                why.append("电池返回后需充电周转（占用至充满），组内峰值被放大")
+        rows.append({"K": K, "资源": RES_NAME[k], "不分区需求": BASE["need"][k], "分区后需求合计": res["total"][k],
+                     "库存": STOCK[k], "冗余": res["redund"][k], "缺口": res["gap"][k],
+                     "各组需求": "，".join(parts), "原因": "；".join(why)})
+    return rows
 
 
-# ========== 第五部分：资源缺口分析 ==========
-
-def analyze_resource_gap(results):
-    """
-    对比现有库存，计算资源缺口
-    """
-    # 现有库存
-    inventory = {
-        "uav": {"A": 0, "B": 0, "C": 0},
-        "batt": {"A": 0, "B": 0, "C": 0},
-        "relay_uav": len(RELAY_IDS),
-        "module": MODULES["count"]
-    }
-    
-    for u, g in DRONES:
-        inventory["uav"][g] += 1
-    
-    for g, info in BATTERIES.items():
-        inventory["batt"][g] = info["count"]
-    
-    # 计算缺口
-    gaps = {}
-    for i, res in results.items():
-        gap = {"uav": {}, "batt": {}, "relay_uav": 0, "module": 0}
-        
-        for g in ["A", "B", "C"]:
-            gap["uav"][g] = max(0, res["resources"]["uav"][g] - inventory["uav"][g])
-            gap["batt"][g] = max(0, res["resources"]["batt"][g] - inventory["batt"][g])
-        
-        gap["relay_uav"] = max(0, res["resources"]["relay_uav"] - inventory["relay_uav"])
-        gap["module"] = max(0, res["resources"]["module"] - inventory["module"])
-        
-        gap["total"] = (sum(gap["uav"].values()) + sum(gap["batt"].values()) 
-                       + gap["relay_uav"] + gap["module"])
-        
-        gaps[i] = gap
-    
-    return gaps, inventory
+def assignment_rows(K, res):
+    """给出每组达到最少资源数的具体分配（组内编号），证明配置可执行"""
+    rows = []
+    for g, gr in enumerate(res["groups"], 1):
+        trips = trips_of(gr["blocks"])
+        for tp in "ABC":
+            ts = [t for t in trips if t["g"] == tp]
+            ua = interval_assign([(t["tid"], t["start"], t["end"]) for t in ts])
+            ba = interval_assign([(t["tid"], t["start"], t["charge_end"]) for t in ts])
+            for t in ts:
+                rows.append({"K": K, "任务组": f"G{g}", "任务": t["tid"], "类型": f"{tp}型运输",
+                             "开始(s)": round(t["start"], 1), "结束(s)": round(t["end"], 1),
+                             "组内无人机": f"G{g}-{tp}{ua[t['tid']]}", "组内电池": f"G{g}-{tp}B{ba[t['tid']]}"})
+        ra = interval_assign([(r["rid"], r["launch"], r["ret"] + RELAY["turn"]) for r in gr["relays"]])
+        ma = interval_assign([(r["rid"], r["launch"], r["charge_end"]) for r in gr["relays"]])
+        for r in gr["relays"]:
+            rows.append({"K": K, "任务组": f"G{g}", "任务": r["rid"], "类型": f"中继@{r['site']}",
+                         "开始(s)": round(r["launch"], 1), "结束(s)": round(r["ret"], 1),
+                         "组内无人机": f"G{g}-R{ra[r['rid']]}", "组内电池": f"G{g}-M{ma[r['rid']]}"})
+    return rows
 
 
-# ========== 第六部分：输出表格和图形 ==========
-
-def create_partition_tables(partition, results, gaps, inventory, n_groups):
-    """生成分区方案表、资源配置表、资源缺口表"""
-    
-    # 分区方案表
-    partition_rows = []
-    for i in range(n_groups):
-        areas_str = ", ".join(sorted(results[i]["areas"]))
-        partition_rows.append({
-            "任务组": f"组{i+1}",
-            "服务区列表": areas_str,
-            "服务区数量": results[i]["n_areas"],
-            "运输架次": results[i]["n_trips"],
-            "中继架次": results[i]["n_relay"],
-            "运输能耗(kWh)": round(results[i]["energy"], 2),
-            "中继能耗(kWh)": round(results[i]["relay_energy"], 2),
-            "完成时间(s)": round(max(results[i]["makespan"], results[i]["relay_makespan"]), 1)
-        })
-    
-    df_partition = pd.DataFrame(partition_rows)
-    
-    # 资源配置表
-    resource_rows = []
-    for i in range(n_groups):
-        res = results[i]["resources"]
-        resource_rows.append({
-            "任务组": f"组{i+1}",
-            "A型无人机": res["uav"]["A"],
-            "B型无人机": res["uav"]["B"],
-            "C型无人机": res["uav"]["C"],
-            "A型电池": res["batt"]["A"],
-            "B型电池": res["batt"]["B"],
-            "C型电池": res["batt"]["C"],
-            "中继无人机": res["relay_uav"],
-            "能源组件": res["module"]
-        })
-    
-    # 添加总计行
-    total_row = {"任务组": "总计"}
-    for key in ["A型无人机", "B型无人机", "C型无人机", "A型电池", "B型电池", "C型电池", "中继无人机", "能源组件"]:
-        total_row[key] = sum(row[key] for row in resource_rows)
-    resource_rows.append(total_row)
-    
-    # 添加库存行
-    inv_row = {
-        "任务组": "现有库存",
-        "A型无人机": inventory["uav"]["A"],
-        "B型无人机": inventory["uav"]["B"],
-        "C型无人机": inventory["uav"]["C"],
-        "A型电池": inventory["batt"]["A"],
-        "B型电池": inventory["batt"]["B"],
-        "C型电池": inventory["batt"]["C"],
-        "中继无人机": inventory["relay_uav"],
-        "能源组件": inventory["module"]
-    }
-    resource_rows.append(inv_row)
-    
-    df_resources = pd.DataFrame(resource_rows)
-    
-    # 资源缺口表
-    gap_rows = []
-    for i in range(n_groups):
-        gap = gaps[i]
-        gap_rows.append({
-            "任务组": f"组{i+1}",
-            "A型无人机缺口": gap["uav"]["A"],
-            "B型无人机缺口": gap["uav"]["B"],
-            "C型无人机缺口": gap["uav"]["C"],
-            "A型电池缺口": gap["batt"]["A"],
-            "B型电池缺口": gap["batt"]["B"],
-            "C型电池缺口": gap["batt"]["C"],
-            "中继无人机缺口": gap["relay_uav"],
-            "能源组件缺口": gap["module"],
-            "总缺口": gap["total"]
-        })
-    
-    df_gaps = pd.DataFrame(gap_rows)
-    
-    return df_partition, df_resources, df_gaps
-
-
-
-def draw_partition_map(partition, n_groups, fname):
-    """在DEM底图上画出分区结果，不同颜色代表不同任务组"""
-    lons = [NODES[k]["lon"] for k in NODES]
-    lats = [NODES[k]["lat"] for k in NODES]
-    x0, x1 = min(lons) - 0.02, max(lons) + 0.02
-    y0, y1 = min(lats) - 0.02, max(lats) + 0.02
+def draw_partition(res, K, fname):
+    lons = [NODES[k]["lon"] for k in NODES] + [s["pos"][0] for s in SITES.values()]
+    lats = [NODES[k]["lat"] for k in NODES] + [s["pos"][1] for s in SITES.values()]
+    x0, x1 = min(lons) - 0.015, max(lons) + 0.015
+    y0, y1 = min(lats) - 0.015, max(lats) + 0.015
     c0, c1 = int((x0 - DEM_X0) / DEM_DX), int((x1 - DEM_X0) / DEM_DX)
     r0, r1 = int((DEM_Y0 - y1) / DEM_DY), int((DEM_Y0 - y0) / DEM_DY)
-    
-    fig, ax = plt.subplots(figsize=(12, 10))
-    im = ax.imshow(DEM_Z[r0:r1, c0:c1], extent=[x0, x1, y0, y1], cmap="terrain", origin="upper", alpha=0.6)
-    plt.colorbar(im, ax=ax, label="地面高程 (m)", shrink=0.7)
-    
+    fig, ax = plt.subplots(figsize=(11, 9))
+    ax.imshow(DEM_Z[r0:r1, c0:c1], extent=[x0, x1, y0, y1], cmap="Greys", origin="upper", alpha=0.55)
     colors = ["tab:blue", "tab:orange", "tab:green"]
-    markers = ["o", "s", "^"]
-    
-    # 画调度中心
-    o_node = NODES["O01"]
-    ax.plot(o_node["lon"], o_node["lat"], "k*", ms=18, label="调度中心O01")
-    ax.text(o_node["lon"] + 0.003, o_node["lat"] + 0.003, "O01", fontsize=11, weight="bold")
-    
-    # 按组画服务区
-    for g in range(n_groups):
-        areas_in_group = [s for s, group in partition.items() if group == g]
-        for s in areas_in_group:
-            node = NODES[s]
-            ax.plot(node["lon"], node["lat"], markers[g], color=colors[g], ms=10, 
-                   markeredgecolor='k', markeredgewidth=0.5)
-            ax.text(node["lon"] + 0.002, node["lat"] + 0.002, s, fontsize=8, color=colors[g])
-        
-        ax.plot([], [], markers[g], color=colors[g], ms=10, label=f"任务组{g+1} ({len(areas_in_group)}个服务区)",
-               markeredgecolor='k', markeredgewidth=0.5)
-    
-    ax.set_xlabel("经度 (°)")
-    ax.set_ylabel("纬度 (°)")
-    ax.set_title(f"问题四 任务分区方案（{n_groups}组）")
-    ax.legend(loc="lower left", fontsize=9)
-    plt.tight_layout()
-    plt.savefig(os.path.join(FIG_DIR, fname), dpi=150)
-    plt.close()
+    for g, gr in enumerate(res["groups"]):
+        for t in trips_of(gr["blocks"]):
+            pts = ["O01"] + t["areas"] + ["O01"]
+            ax.plot([NODES[k]["lon"] for k in pts], [NODES[k]["lat"] for k in pts], "-", color=colors[g], lw=1.0, alpha=0.5)
+        for s in gr["areas"]:
+            n = NODES[s]
+            ax.plot(n["lon"], n["lat"], "o", color=colors[g], ms=11, mec="k")
+            ax.text(n["lon"] + 0.002, n["lat"] + 0.002, s, fontsize=9, weight="bold", color=colors[g])
+        nd = gr["need"]
+        ax.plot([], [], "o", color=colors[g], ms=10, mec="k",
+                label=f"G{g + 1}：{len(gr['areas'])}个服务区  运输机A/B/C={nd['U_A']}/{nd['U_B']}/{nd['U_C']}  "
+                      f"电池={nd['B_A']}/{nd['B_B']}/{nd['B_C']}  中继={nd['R']}  组件={nd['M']}")
+    for name, s in SITES.items():
+        ax.plot(s["pos"][0], s["pos"][1], "m^", ms=13, mec="k")
+        ax.text(s["pos"][0] + 0.002, s["pos"][1] - 0.004, f"中继点位{name}", color="m", fontsize=9)
+    o = NODES["O01"]
+    ax.plot(o["lon"], o["lat"], "k*", ms=18)
+    ax.text(o["lon"] + 0.002, o["lat"] + 0.002, "O01", fontsize=10, weight="bold")
+    ax.set_xlabel("经度 (°)"); ax.set_ylabel("纬度 (°)")
+    ax.set_title(f"问题四 {K} 组任务分区（资源缺口 {res['gap_sum']}，资源总数 {res['res_sum']}，工作量CV {res['cv']:.3f}）")
+    ax.legend(loc="lower left", fontsize=8)
+    plt.tight_layout(); plt.savefig(os.path.join(FIG_DIR, fname), dpi=150); plt.close()
 
 
-def draw_comparison_chart(results_2, results_3, fname):
-    """对比2组和3组方案的工作量和资源配置"""
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    
-    # 子图1：架次数对比
-    ax = axes[0, 0]
-    groups_2 = [f"2组-组{i+1}" for i in range(2)]
-    groups_3 = [f"3组-组{i+1}" for i in range(3)]
-    trips_2 = [results_2[i]["n_trips"] for i in range(2)]
-    trips_3 = [results_3[i]["n_trips"] for i in range(3)]
-    relay_2 = [results_2[i]["n_relay"] for i in range(2)]
-    relay_3 = [results_3[i]["n_relay"] for i in range(3)]
-    
-    x = np.arange(5)
-    width = 0.35
-    ax.bar(x[:2] - width/2, trips_2, width, label="运输架次", color="tab:blue")
-    ax.bar(x[:2] + width/2, relay_2, width, label="中继架次", color="tab:orange")
-    ax.bar(x[2:] - width/2, trips_3, width, color="tab:blue")
-    ax.bar(x[2:] + width/2, relay_3, width, color="tab:orange")
-    
-    ax.set_xticks(x)
-    ax.set_xticklabels(groups_2 + groups_3)
-    ax.set_ylabel("架次数")
-    ax.set_title("各组架次数对比")
-    ax.legend()
-    ax.grid(axis='y', alpha=0.3)
-    
-    # 子图2：能耗对比
-    ax = axes[0, 1]
-    energy_2 = [results_2[i]["energy"] for i in range(2)]
-    energy_3 = [results_3[i]["energy"] for i in range(3)]
-    relay_e_2 = [results_2[i]["relay_energy"] for i in range(2)]
-    relay_e_3 = [results_3[i]["relay_energy"] for i in range(3)]
-    
-    ax.bar(x[:2] - width/2, energy_2, width, label="运输能耗", color="tab:green")
-    ax.bar(x[:2] + width/2, relay_e_2, width, label="中继能耗", color="tab:red")
-    ax.bar(x[2:] - width/2, energy_3, width, color="tab:green")
-    ax.bar(x[2:] + width/2, relay_e_3, width, color="tab:red")
-    
-    ax.set_xticks(x)
-    ax.set_xticklabels(groups_2 + groups_3)
-    ax.set_ylabel("能耗 (kWh)")
-    ax.set_title("各组能耗对比")
-    ax.legend()
-    ax.grid(axis='y', alpha=0.3)
-    
-    # 子图3：资源配置对比（无人机）
-    ax = axes[1, 0]
-    uav_2 = [results_2[i]["resources"]["total_uav"] for i in range(2)]
-    uav_3 = [results_3[i]["resources"]["total_uav"] for i in range(3)]
-    batt_2 = [results_2[i]["resources"]["total_batt"] for i in range(2)]
-    batt_3 = [results_3[i]["resources"]["total_batt"] for i in range(3)]
-    
-    ax.bar(x[:2] - width/2, uav_2, width, label="运输无人机", color="tab:purple")
-    ax.bar(x[:2] + width/2, batt_2, width, label="共享电池", color="tab:cyan")
-    ax.bar(x[2:] - width/2, uav_3, width, color="tab:purple")
-    ax.bar(x[2:] + width/2, batt_3, width, color="tab:cyan")
-    
-    ax.set_xticks(x)
-    ax.set_xticklabels(groups_2 + groups_3)
-    ax.set_ylabel("资源数量")
-    ax.set_title("运输资源配置对比")
-    ax.legend()
-    ax.grid(axis='y', alpha=0.3)
-    
-    # 子图4：中继资源配置对比
-    ax = axes[1, 1]
-    relay_uav_2 = [results_2[i]["resources"]["relay_uav"] for i in range(2)]
-    relay_uav_3 = [results_3[i]["resources"]["relay_uav"] for i in range(3)]
-    module_2 = [results_2[i]["resources"]["module"] for i in range(2)]
-    module_3 = [results_3[i]["resources"]["module"] for i in range(3)]
-    
-    ax.bar(x[:2] - width/2, relay_uav_2, width, label="中继无人机", color="tab:brown")
-    ax.bar(x[:2] + width/2, module_2, width, label="能源组件", color="tab:pink")
-    ax.bar(x[2:] - width/2, relay_uav_3, width, color="tab:brown")
-    ax.bar(x[2:] + width/2, module_3, width, color="tab:pink")
-    
-    ax.set_xticks(x)
-    ax.set_xticklabels(groups_2 + groups_3)
-    ax.set_ylabel("资源数量")
-    ax.set_title("中继资源配置对比")
-    ax.legend()
-    ax.grid(axis='y', alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(FIG_DIR, fname), dpi=150)
-    plt.close()
+def draw_compare(best, all_res, fname):
+    fig, axes = plt.subplots(1, 3, figsize=(19, 5.5))
+    ax = axes[0]
+    x = np.arange(len(RES_KEYS))
+    w = 0.27
+    ax.bar(x - w, [BASE["need"][k] for k in RES_KEYS], w, label="不分区（问题三）", color="0.6")
+    ax.bar(x, [best[2]["total"][k] for k in RES_KEYS], w, label="2组", color="tab:blue")
+    ax.bar(x + w, [best[3]["total"][k] for k in RES_KEYS], w, label="3组", color="tab:orange")
+    ax.plot(x, [STOCK[k] for k in RES_KEYS], "r_", ms=30, mew=3, label="现有库存")
+    ax.set_xticks(x); ax.set_xticklabels([RES_NAME[k] for k in RES_KEYS], rotation=35, ha="right")
+    ax.set_ylabel("数量"); ax.set_title("资源配置规模与库存对比"); ax.legend(fontsize=8); ax.grid(axis="y", alpha=0.3)
+    ax = axes[1]
+    for K, col in ((2, "tab:blue"), (3, "tab:orange")):
+        for g, gr in enumerate(best[K]["groups"]):
+            lab = f"K={K}-G{g + 1}"
+            ax.bar(lab, gr["work_t"] / 3600, color=col)
+            ax.bar(lab, gr["work_r"] / 3600, bottom=gr["work_t"] / 3600, color=col, alpha=0.45)
+    ax.set_ylabel("作业时长 (h)（深色=运输，浅色=中继）"); ax.set_title("组间工作量"); ax.grid(axis="y", alpha=0.3)
+    ax = axes[2]
+    for K, mk in ((2, "o"), (3, "s")):
+        rs = all_res[K]
+        sc = ax.scatter([r["res_sum"] + (0.12 if K == 3 else -0.12) for r in rs], [r["cv"] for r in rs],
+                        c=[r["gap_sum"] for r in rs], cmap="RdYlGn_r", marker=mk, s=14, alpha=0.6, label=f"K={K} 全部划分")
+        ax.scatter([best[K]["res_sum"]], [best[K]["cv"]], marker="*", s=300, c="k")
+        ax.annotate(f"K={K} 推荐", (best[K]["res_sum"], best[K]["cv"]), textcoords="offset points", xytext=(8, 8))
+    ax.axhline(CV_MAX, color="k", ls="--", lw=0.8)
+    ax.text(ax.get_xlim()[0], CV_MAX, f" ε = {CV_MAX}", va="bottom", fontsize=8)
+    plt.colorbar(sc, ax=ax, label="资源缺口合计")
+    ax.set_xlabel("资源配置总数"); ax.set_ylabel("组间工作量变异系数 CV"); ax.set_title("穷举全部分区：规模-均衡-缺口")
+    ax.legend(fontsize=8)
+    plt.tight_layout(); plt.savefig(os.path.join(FIG_DIR, fname), dpi=150); plt.close()
 
 
-def generate_analysis_text(partition, results, gaps, inventory, n_groups):
-    """生成分析文本"""
-    text = []
-    text.append(f"=" * 60)
-    text.append(f"任务分区方案分析（{n_groups}组）")
-    text.append(f"=" * 60)
-    text.append("")
-    
-    # 分区信息
-    text.append("【分区概况】")
-    for i in range(n_groups):
-        text.append(f"  任务组{i+1}：{results[i]['n_areas']}个服务区")
-        text.append(f"    服务区：{', '.join(sorted(results[i]['areas']))}")
-        text.append(f"    运输架次：{results[i]['n_trips']}  中继架次：{results[i]['n_relay']}")
-        text.append(f"    运输能耗：{results[i]['energy']:.2f} kWh  中继能耗：{results[i]['relay_energy']:.2f} kWh")
-        text.append(f"    完成时间：{fmt_hms(max(results[i]['makespan'], results[i]['relay_makespan']))}")
-        text.append("")
-    
-    # 工作量平衡性
-    trips = [results[i]['n_trips'] + results[i]['n_relay'] for i in range(n_groups)]
-    energies = [results[i]['energy'] + results[i]['relay_energy'] for i in range(n_groups)]
-    text.append("【工作量平衡性】")
-    text.append(f"  架次数：平均 {np.mean(trips):.1f}，标准差 {np.std(trips):.2f}")
-    text.append(f"  总能耗：平均 {np.mean(energies):.2f} kWh，标准差 {np.std(energies):.2f} kWh")
-    text.append(f"  平衡性评价：{'良好' if np.std(trips) < 5 and np.std(energies) < 30 else '中等' if np.std(trips) < 10 else '较差'}")
-    text.append("")
-    
-    # 资源配置
-    text.append("【资源配置规模】")
-    total_uav = sum(results[i]["resources"]["total_uav"] for i in range(n_groups))
-    total_batt = sum(results[i]["resources"]["total_batt"] for i in range(n_groups))
-    total_relay = sum(results[i]["resources"]["relay_uav"] for i in range(n_groups))
-    total_module = sum(results[i]["resources"]["module"] for i in range(n_groups))
-    
-    text.append(f"  运输无人机总需求：{total_uav} 架（库存：{sum(inventory['uav'].values())} 架）")
-    text.append(f"  共享电池总需求：{total_batt} 组（库存：{sum(inventory['batt'].values())} 组）")
-    text.append(f"  中继无人机总需求：{total_relay} 架（库存：{inventory['relay_uav']} 架）")
-    text.append(f"  能源组件总需求：{total_module} 组（库存：{inventory['module']} 组）")
-    text.append("")
-    
-    # 资源缺口
-    total_gap = sum(gaps[i]["total"] for i in range(n_groups))
-    text.append("【资源缺口分析】")
-    if total_gap == 0:
-        text.append("  ✓ 现有库存完全满足需求，无资源缺口")
-    else:
-        text.append(f"  ✗ 存在资源缺口，总计缺少 {int(total_gap)} 个资源单元")
-        for i in range(n_groups):
-            gap = gaps[i]
-            if gap["total"] > 0:
-                text.append(f"    任务组{i+1}缺口：")
-                for g in ["A", "B", "C"]:
-                    if gap["uav"][g] > 0:
-                        text.append(f"      {g}型无人机：{gap['uav'][g]} 架")
-                    if gap["batt"][g] > 0:
-                        text.append(f"      {g}型电池：{gap['batt'][g]} 组")
-                if gap["relay_uav"] > 0:
-                    text.append(f"      中继无人机：{gap['relay_uav']} 架")
-                if gap["module"] > 0:
-                    text.append(f"      能源组件：{gap['module']} 组")
-    
-    text.append("")
-    text.append("【资源冗余分析】")
-    # 资源冗余 = 各组需求之和 - 不分区时的需求
-    # 简化：用总需求与库存对比
-    redundancy = max(0, total_uav - inventory["uav"]["A"] - inventory["uav"]["B"] - inventory["uav"]["C"])
-    redundancy += max(0, total_batt - sum(inventory["batt"].values()))
-    redundancy += max(0, total_relay - inventory["relay_uav"])
-    redundancy += max(0, total_module - inventory["module"])
-    
-    if redundancy == 0:
-        text.append("  资源利用率：优秀（分区后总需求未超过库存）")
-    else:
-        text.append(f"  分区导致的额外资源需求：{redundancy} 个单元")
-        text.append(f"  原因：各组独立执行，无法跨组共享资源，高峰期重叠导致需求叠加")
-    
-    text.append("")
-    return "\n".join(text)
+def draw_group_gantt(res, K, fname):
+    rows, bars = [], []
+    for g, gr in enumerate(res["groups"], 1):
+        trips = trips_of(gr["blocks"])
+        for tp in "ABC":
+            ts = [t for t in trips if t["g"] == tp]
+            ua = interval_assign([(t["tid"], t["start"], t["end"]) for t in ts])
+            for t in ts:
+                name = f"G{g}-{tp}{ua[t['tid']]}"
+                if name not in rows:
+                    rows.append(name)
+                bars.append((name, t["start"], t["end"], t["tid"][3:], g))
+        ra = interval_assign([(r["rid"], r["launch"], r["ret"] + RELAY["turn"]) for r in gr["relays"]])
+        for r in gr["relays"]:
+            name = f"G{g}-R{ra[r['rid']]}"
+            if name not in rows:
+                rows.append(name)
+            bars.append((name, r["launch"], r["ret"], r["rid"][3:] + "@" + r["site"], g))
+    rows.sort(key=lambda s: (s.split("-")[0], s.split("-")[1][0] == "R", s))
+    colors = ["tab:blue", "tab:orange", "tab:green"]
+    fig, ax = plt.subplots(figsize=(15, 0.34 * len(rows) + 1.6))
+    for name, a, b, lab, g in bars:
+        y = rows.index(name)
+        ax.barh(y, b - a, left=a, color=colors[g - 1], edgecolor="k", height=0.6,
+                hatch="//" if "@" in lab else None, alpha=0.85)
+        ax.text(a + 15, y, lab, va="center", fontsize=6)
+    ax.set_yticks(range(len(rows))); ax.set_yticklabels(rows); ax.invert_yaxis()
+    ax.set_xlabel("时间 (s)（斜线=中继架次）"); ax.set_title(f"问题四 {K} 组独立执行的资源占用（组内编号）")
+    plt.tight_layout(); plt.savefig(os.path.join(FIG_DIR, fname), dpi=150); plt.close()
 
 
-# ========== 主程序 ==========
-
+# ---------------------------------------------------------------
+# 主程序
+# ---------------------------------------------------------------
 if __name__ == "__main__":
-    print("=" * 70)
-    print("问题四：救援任务分区与资源配置优化方案")
-    print("=" * 70)
-    
-    # Step 1: 加载问题三的联合调度方案
-    print("\n[Step 1] 加载问题三结果...")
-    try:
-        with open(os.path.join(RESULT_DIR, "Q3_结果.xlsx"), "rb") as f:
-            df_q3_trip = pd.read_excel(f, sheet_name="Q3_运输架次")
-            df_q3_relay = pd.read_excel(f, sheet_name="Q3_中继架次")
-        print(f"  ✓ 读取到 {len(df_q3_trip)} 个运输架次，{len(df_q3_relay)} 个中继架次")
-    except:
-        print("  ✗ 未找到问题三结果，请先运行 q3.py")
-        print("  使用模拟数据继续演示...")
-        # 使用问题二的结果代替
-        with open(os.path.join(RESULT_DIR, "q2_best.pkl"), "rb") as f:
-            q2_sol = pickle.load(f)
-        # 简单评估生成plan
-        plan = vrp.schedule(q2_sol)
-        relay_info = {"sorties": [], "energy": 0}
-    else:
-        # 从Excel重建plan结构（简化版）
-        # 实际应该保存完整的pickle，这里用问题二的结果
-        with open(os.path.join(RESULT_DIR, "q2_best.pkl"), "rb") as f:
-            q2_sol = pickle.load(f)
-        plan = vrp.schedule(q2_sol)
-        # 中继信息简化处理
-        relay_info = {"sorties": [], "energy": 0}
-        print("  注：使用问题二运输方案（问题三完整方案需pickle保存）")
-    
-    print(f"  运输架次数：{len(plan)}")
-    print(f"  涉及服务区：{len(set(s for p in plan for s, _ in p['ev']['stops']))} 个")
-    
-    # Step 2: 构建依赖图
-    print("\n[Step 2] 构建服务区依赖图...")
-    G = build_dependency_graph(plan)
-    print(f"  节点数：{G.number_of_nodes()}，边数：{G.number_of_edges()}")
-    multi_stop_trips = sum(1 for p in plan if len(p["ev"]["stops"]) > 1)
-    print(f"  多点访问架次：{multi_stop_trips} 个")
-    
-    # Step 3: 2组分区
-    print("\n[Step 3] 求解2组分区方案...")
-    print("  使用谱分割算法初始化...")
-    partition_2_init = initial_partition_2(G, plan)
-    partition_2_init = fix_partition_constraints(partition_2_init, plan)
-    
-    print("  模拟退火优化中...")
-    partition_2, cost_2 = optimize_partition(partition_2_init, plan, relay_info, 
-                                             iters=8000, target="balance")
-    
-    results_2, balance_2, total_res_2 = evaluate_partition(partition_2, plan, relay_info)
-    print(f"  ✓ 2组方案：平衡性评分 {balance_2:.2f}，总资源需求 {total_res_2}")
-    
-    gaps_2, inventory = analyze_resource_gap(results_2)
-    
-    # Step 4: 3组分区
-    print("\n[Step 4] 求解3组分区方案...")
-    print("  使用K-means聚类初始化...")
-    partition_3_init = initial_partition_3(plan)
-    partition_3_init = fix_partition_constraints(partition_3_init, plan)
-    
-    print("  模拟退火优化中...")
-    partition_3, cost_3 = optimize_partition(partition_3_init, plan, relay_info, 
-                                             iters=8000, target="balance")
-    
-    results_3, balance_3, total_res_3 = evaluate_partition(partition_3, plan, relay_info)
-    print(f"  ✓ 3组方案：平衡性评分 {balance_3:.2f}，总资源需求 {total_res_3}")
-    
-    gaps_3, _ = analyze_resource_gap(results_3)
-    
-    # Step 5: 生成输出表格
-    print("\n[Step 5] 生成输出表格...")
-    df_part_2, df_res_2, df_gap_2 = create_partition_tables(partition_2, results_2, gaps_2, inventory, 2)
-    df_part_3, df_res_3, df_gap_3 = create_partition_tables(partition_3, results_3, gaps_3, inventory, 3)
-    
-    # 保存Excel
+    print("===== 问题四：救援任务分区与资源配置 =====")
+    print(f"问题三方案：运输架次 {len(TRIPS)}，中继架次 {len(RELAYS)}")
+    print("不可拆分的服务区块（同一架次访问的服务区合并）：")
+    for k, blk in enumerate(BLOCKS):
+        print(f"  块{k + 1}: {blk}  运输架次 {sum(1 for t in TRIPS if TRIP_BLOCK[t['tid']] == k)}")
+    print("不分区（问题三原方案）资源需求：", BASE["need"], " 库存：", STOCK)
+    multi = {rid: sorted({BLOCKS[TRIP_BLOCK[t]][0] for t in USAGE if rid in USAGE[t]}) for rid in RELAYS}
+    for rid, v in multi.items():
+        print(f"  {rid}（点位 {RELAYS[rid]['site']}）保障的块：{v}")
+
+    all_res, best = {}, {}
+    cmp_rows, conf_rows, work_rows, gap_rows, asg_rows, top_rows, modeB_rows, eps_rows = [], [], [], [], [], [], [], []
+    for K in (2, 3):
+        rs = [evaluate_partition(lb, K) for lb in partitions(len(BLOCKS), K)]
+        rs.sort(key=lex_key)
+        all_res[K] = rs
+        best[K] = best_under(rs, CV_MAX)
+        front = pareto(rs)
+        print(f"\nK={K}：共穷举 {len(rs)} 种分区，帕累托非支配解 {len(front)} 个")
+        for eps in EPS_LIST:
+            b = best_under(rs, eps)
+            if b is None:
+                continue
+            eps_rows.append({"K": K, "ε（CV上限）": "不限" if eps == float("inf") else eps,
+                             "满足约束的分区数": sum(1 for r in rs if r["cv"] <= eps + 1e-12),
+                             "资源缺口": b["gap_sum"], "资源总数": b["res_sum"], "冗余": b["red_sum"],
+                             "工作量CV": round(b["cv"], 4), "最大/最小": round(b["ratio"], 3),
+                             "分区": " | ".join(",".join(g["areas"]) for g in b["groups"])})
+            print(f"   ε={eps}: 缺口 {b['gap_sum']}  资源 {b['res_sum']}  CV {b['cv']:.3f}  "
+                  f"{[g['areas'] for g in b['groups']]}")
+        ranked = sorted([r for r in rs if r["cv"] <= CV_MAX + 1e-12], key=lex_key)
+        for rank, r in enumerate(ranked[:10], 1):
+            top_rows.append({"K": K, "排名": rank, "分区": " | ".join(",".join(g["areas"]) for g in r["groups"]),
+                             "资源缺口": r["gap_sum"], "资源总数": r["res_sum"], "冗余": r["red_sum"],
+                             "工作量CV": round(r["cv"], 4), "最大/最小": round(r["ratio"], 3),
+                             "是否帕累托": any(r is f for f in front)})
+        # 两个极端作对照，说明“省资源”与“均衡”之间的权衡
+        lean = rs[0]
+        bal = min(rs, key=lambda r: (r["cv"], r["gap_sum"], r["res_sum"]))
+        cmp_rows.append(compare_rows(K, best[K], f"{K}组-推荐（CV≤{CV_MAX}，缺口→规模→均衡）"))
+        cmp_rows.append(compare_rows(K, lean, f"{K}组-极端①只省资源（不限均衡）"))
+        cmp_rows.append(compare_rows(K, bal, f"{K}组-极端②只求均衡"))
+        conf_rows += config_rows(K, best[K])
+        work_rows += workload_rows(K, best[K])
+        gap_rows += gap_reasons(K, best[K])
+        asg_rows += assignment_rows(K, best[K])
+        rb = evaluate_partition(list(best[K]["labels"]), K, mode="B")
+        modeB_rows.append({"K": K, "口径": "A 原中继架次整体复制（主口径）", "中继无人机": best[K]["total"]["R"],
+                           "中继能源组件": best[K]["total"]["M"], "中继架次（含复制）": sum(g["n_relay"] for g in best[K]["groups"]),
+                           "中继能耗(kWh)": round(sum(g["E_r"] for g in best[K]["groups"]), 3)})
+        modeB_rows.append({"K": K, "口径": "B 副本收缩到本组使用区间", "中继无人机": rb["total"]["R"],
+                           "中继能源组件": rb["total"]["M"], "中继架次（含复制）": sum(g["n_relay"] for g in rb["groups"]),
+                           "中继能耗(kWh)": round(sum(g["E_r"] for g in rb["groups"]), 3)})
+    base_row = {"方案": "不分区（问题三原方案）", "K": 1, "资源配置总数": sum(BASE["need"].values()),
+                "资源冗余(相对不分区)": 0, "资源缺口合计": 0, "工作量CV": 0.0, "工作量最大/最小": 1.0, "组完成时刻极差(s)": 0.0}
+    for k in RES_KEYS:
+        base_row[f"{RES_NAME[k]}(需求/库存)"] = f"{BASE['need'][k]}/{STOCK[k]}"
+    cmp_rows.insert(0, base_row)
+    modeB_rows.insert(0, {"K": 1, "口径": "不分区", "中继无人机": BASE["need"]["R"], "中继能源组件": BASE["need"]["M"],
+                          "中继架次（含复制）": len(RELAYS), "中继能耗(kWh)": round(BASE["E_r"], 3)})
+
+    df_conf = pd.DataFrame(conf_rows)
+    df_cmp = pd.DataFrame(cmp_rows)
+    df_work = pd.DataFrame(work_rows)
+    df_gap = pd.DataFrame(gap_rows) if gap_rows else pd.DataFrame([{"说明": "无资源缺口与冗余"}])
+    df_top = pd.DataFrame(top_rows)
+    df_asg = pd.DataFrame(asg_rows)
+    df_mb = pd.DataFrame(modeB_rows)
+    df_blk = pd.DataFrame([{"块": f"块{k + 1}", "服务区": ",".join(b),
+                            "运输架次": ",".join(t["tid"] for t in TRIPS if TRIP_BLOCK[t["tid"]] == k)}
+                           for k, b in enumerate(BLOCKS)])
+    print("\n" + df_conf.to_string(index=False))
+    print("\n" + df_cmp.to_string(index=False))
+    print("\n" + df_work.drop(columns=["运输架次列表"]).to_string(index=False))
+    print("\n" + df_gap.to_string(index=False))
+    print("\n" + df_mb.to_string(index=False))
+    print("\n" + pd.DataFrame(eps_rows).drop(columns=["分区"]).to_string(index=False))
+
     with pd.ExcelWriter(os.path.join(RESULT_DIR, "Q4_结果.xlsx")) as w:
-        df_part_2.to_excel(w, sheet_name="2组分区方案", index=False)
-        df_res_2.to_excel(w, sheet_name="2组资源配置", index=False)
-        df_gap_2.to_excel(w, sheet_name="2组资源缺口", index=False)
-        df_part_3.to_excel(w, sheet_name="3组分区方案", index=False)
-        df_res_3.to_excel(w, sheet_name="3组资源配置", index=False)
-        df_gap_3.to_excel(w, sheet_name="3组资源缺口", index=False)
-    
-    print("  ✓ 已保存到 结果/Q4_结果.xlsx")
-    
-    # Step 6: 生成分析报告
-    print("\n[Step 6] 生成分析报告...")
-    analysis_2 = generate_analysis_text(partition_2, results_2, gaps_2, inventory, 2)
-    analysis_3 = generate_analysis_text(partition_3, results_3, gaps_3, inventory, 3)
-    
-    with open(os.path.join(RESULT_DIR, "Q4_分析报告.txt"), "w", encoding="utf-8") as f:
-        f.write(analysis_2)
-        f.write("\n\n")
-        f.write(analysis_3)
-        f.write("\n\n")
-        f.write("=" * 60 + "\n")
-        f.write("两种分区方案对比\n")
-        f.write("=" * 60 + "\n\n")
-        f.write(f"【资源配置规模】\n")
-        f.write(f"  2组方案总需求：{total_res_2} 个资源单元\n")
-        f.write(f"  3组方案总需求：{total_res_3} 个资源单元\n")
-        f.write(f"  差异：3组比2组{'多' if total_res_3 > total_res_2 else '少'} {abs(total_res_3 - total_res_2)} 个单元\n\n")
-        
-        f.write(f"【工作量平衡性】\n")
-        f.write(f"  2组方案平衡性评分：{balance_2:.2f}\n")
-        f.write(f"  3组方案平衡性评分：{balance_3:.2f}\n")
-        f.write(f"  评价：{'3组更平衡' if balance_3 < balance_2 else '2组更平衡'}\n\n")
-        
-        total_gap_2 = sum(gaps_2[i]["total"] for i in range(2))
-        total_gap_3 = sum(gaps_3[i]["total"] for i in range(3))
-        f.write(f"【资源缺口】\n")
-        f.write(f"  2组方案总缺口：{int(total_gap_2)} 个单元\n")
-        f.write(f"  3组方案总缺口：{int(total_gap_3)} 个单元\n\n")
-        
-        f.write(f"【建议】\n")
-        if total_gap_2 == 0 and total_gap_3 > 0:
-            f.write("  推荐采用2组方案，现有库存可满足需求。\n")
-        elif total_gap_3 == 0 and total_gap_2 > 0:
-            f.write("  推荐采用3组方案，现有库存可满足需求且工作量更平衡。\n")
-        elif total_gap_2 < total_gap_3:
-            f.write("  推荐采用2组方案，资源缺口更小。\n")
-        else:
-            f.write("  推荐采用3组方案，工作量更平衡，便于独立执行。\n")
-    
-    print("  ✓ 已保存到 结果/Q4_分析报告.txt")
-    
-    # Step 7: 绘制可视化图形
-    print("\n[Step 7] 绘制可视化图形...")
-    draw_partition_map(partition_2, 2, "Q4_2组分区地图.png")
-    print("  ✓ 2组分区地图")
-    draw_partition_map(partition_3, 3, "Q4_3组分区地图.png")
-    print("  ✓ 3组分区地图")
-    draw_comparison_chart(results_2, results_3, "Q4_方案对比.png")
-    print("  ✓ 方案对比图")
-    
-    # Step 8: 打印摘要
-    print("\n" + "=" * 70)
-    print("问题四求解完成！")
-    print("=" * 70)
-    print("\n【2组分区方案摘要】")
-    print(df_part_2.to_string(index=False))
-    print("\n【3组分区方案摘要】")
-    print(df_part_3.to_string(index=False))
-    print("\n【资源缺口对比】")
-    print(f"  2组方案：总缺口 {int(total_gap_2)} 个单元")
-    print(f"  3组方案：总缺口 {int(total_gap_3)} 个单元")
-    print("\n所有结果已保存到 结果/ 目录")
-    print("  - Q4_结果.xlsx（详细表格）")
-    print("  - Q4_分析报告.txt（文字分析）")
-    print("  - Q4_2组分区地图.png")
-    print("  - Q4_3组分区地图.png")
-    print("  - Q4_方案对比.png")
+        df_conf.to_excel(w, sheet_name="Q4_分区配置", index=False)
+        df_cmp.to_excel(w, sheet_name="方案比较", index=False)
+        df_work.to_excel(w, sheet_name="组间工作量", index=False)
+        df_gap.to_excel(w, sheet_name="冗余与缺口原因", index=False)
+        df_mb.to_excel(w, sheet_name="中继复制口径对比", index=False)
+        pd.DataFrame(eps_rows).to_excel(w, sheet_name="ε约束权衡曲线", index=False)
+        df_top.to_excel(w, sheet_name="候选分区Top10", index=False)
+        df_asg.to_excel(w, sheet_name="组内资源分配", index=False)
+        df_blk.to_excel(w, sheet_name="服务区块", index=False)
+    draw_partition(best[2], 2, "Q4_2组分区地图.png")
+    draw_partition(best[3], 3, "Q4_3组分区地图.png")
+    draw_compare(best, all_res, "Q4_方案对比.png")
+    draw_group_gantt(best[2], 2, "Q4_2组资源甘特图.png")
+    draw_group_gantt(best[3], 3, "Q4_3组资源甘特图.png")
+    print("\n问题四完成，结果已保存到 结果/Q4_结果.xlsx 与 结果/图/。")
