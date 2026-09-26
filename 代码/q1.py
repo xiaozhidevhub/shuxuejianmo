@@ -21,7 +21,7 @@ matplotlib.use("Agg")                     # 不弹窗口，直接保存图片
 import matplotlib.pyplot as plt
 from common import *
 
-plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei"]   # 图中显示中文
+plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "WenQuanYi Micro Hei", "Droid Sans Fallback"]   # 图中显示中文
 plt.rcParams["axes.unicode_minus"] = False
 
 KINDS = ["MED", "WAT", "FOD", "HYG"]

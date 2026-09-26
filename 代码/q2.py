@@ -4,7 +4,7 @@ q2.py —— 问题二：异构无人机多点多架次运输调度（不考虑�
 =========================================================
 求解流程：
   1. 初始解：问题一的单点最优组批（每个服务区单独成批）
-  2. 多个随机种子分别做模拟退火，取最好的解，再用爬山法“修正”
+  2. 多个随机种子分别做模拟退火 + 爬山“修正”，再对最好的两个解做“迭代低温重启”集中搜索
   3. 改变目标权重（时效优先 / 能耗优先 / 架次优先）重新优化，分析权衡关系
   4. 输出运输架次表、逐箱交付表、资源使用情况、可行性检验和图
 """
@@ -18,14 +18,37 @@ import matplotlib.pyplot as plt
 import vrp
 from common import *
 
-plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei"]
+plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "WenQuanYi Micro Hei", "Droid Sans Fallback"]
 plt.rcParams["axes.unicode_minus"] = False
 
 
-def optimize(weights, seeds=(1, 2, 3), iters=40000, init=None, verbose=True):
-    """在给定权重下，多种子退火 + 爬山修正，返回最优解"""
+def intensify(sol, cost, seed0=300, patience=12, iters=60000, verbose=True):
+    """
+    迭代低温重启退火（集中搜索）：每轮从当前最优解出发，以较低初温（2/4/8 轮换）重新退火并爬山，
+    有改进就接受并清零计数，连续 patience 轮无改进即停止。
+    单次高温长退火后期大部分迭代停留在最优解附近的劣解区，而这一步反复从最优解附近重新搜索，
+    对“组批 + 顺序 + 资源时序”这种强耦合地形的改进非常明显。
+    """
+    fail, sd = 0, seed0
+    t0 = time.time()
+    while fail < patience:
+        sd += 1
+        T0 = (2.0, 4.0, 8.0)[sd % 3]
+        s, c = vrp.anneal(sol, iters=iters, T0=T0, seed=sd, verbose=False)
+        s, c = vrp.local_polish(s, rounds=4)
+        if c < cost - 1e-6:
+            sol, cost, fail = s, c, 0
+            if verbose:
+                print(f"    集中搜索 种子 {sd}（初温 {T0}）：目标值 {cost:.2f}，用时 {time.time() - t0:.0f}s")
+        else:
+            fail += 1
+    return sol, cost
+
+
+def optimize(weights, seeds=(1, 2, 3), iters=40000, init=None, verbose=True, top=2, patience=12):
+    """在给定权重下：多种子退火 + 爬山修正，再对最好的 top 个解做迭代低温重启集中搜索，返回最优解"""
     vrp.WEIGHTS.update(weights)
-    best, best_cost = None, float("inf")
+    found = []
     for sd in seeds:
         start = init if init is not None else vrp.initial_from_q1()
         t0 = time.time()
@@ -33,8 +56,15 @@ def optimize(weights, seeds=(1, 2, 3), iters=40000, init=None, verbose=True):
         sol, c = vrp.local_polish(sol)
         if verbose:
             print(f"  种子 {sd}: 目标值 {c:.2f}，用时 {time.time() - t0:.1f}s")
-        if c < best_cost:
-            best, best_cost = sol, c
+        found.append((c, sd, sol))
+    found.sort(key=lambda x: x[0])
+    best, best_cost = found[0][2], found[0][0]
+    for c, sd, sol in found[:top]:
+        s2, c2 = intensify(sol, c, seed0=300 + 100 * sd, patience=patience, verbose=verbose)
+        if verbose:
+            print(f"  种子 {sd} 集中搜索后：{c:.2f} → {c2:.2f}")
+        if c2 < best_cost:
+            best, best_cost = s2, c2
     return best, best_cost
 
 
@@ -181,7 +211,7 @@ if __name__ == "__main__":
     rows = [metrics_row("均衡(主方案)", info)]
     for name, w in scenarios:
         ww = dict(base_w); ww.update(w)
-        sol, _ = optimize(ww, seeds=(7, 8), iters=120000, init=best, verbose=False)
+        sol, _ = optimize(ww, seeds=(7, 8), iters=120000, init=best, verbose=False, top=1, patience=6)
         vrp.WEIGHTS.update(ww)
         _, inf2 = vrp.evaluate(sol, detail=True)
         rows.append(metrics_row(name, inf2))
