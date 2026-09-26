@@ -18,7 +18,8 @@ q3.py —— 问题三：通信约束下的运输与中继联合调度
     若当前时刻无法保障，则在“资源释放事件时刻”集合中搜索最早可行开始时刻（运输等待中继）。
  5. 联合模拟退火（外层）：邻域 = 问题二的 8 种运输邻域（组批/机型/顺序/合并/拆分/优先级）
     + 中继点位邻域（点位局部平移 / 替换为高覆盖候选点），目标同时计入两类无人机的代价。
- 6. 逐秒校验：对最终方案每架运输机逐秒插值三维位置，用 common.link_ok 精确复核通信状态。
+ 6. 精细复核：对最终方案每架运输机按 0.1 s 插值三维位置，用 common.link_ok 精确复核通信状态，
+    切换时刻用二分法精确定位；发现中断则在中断处加密采样并重新调度（闭环修正），直到中断为 0。
 """
 import time
 import pickle
@@ -46,6 +47,7 @@ P_SERVE = R["P_hover"] + R["P_comm"]                  # 悬停 + 通信附加功
 
 # 问题三目标权重（与问题二同一口径，另加中继的架次与能耗）
 W3 = {"hard": 1000.0, "tard": 1.0, "T": 2.0, "E": 5.0, "N": 3.0, "NR": 3.0, "ER": 5.0}
+HANDOVER_GUARD = 1.0      # 中继服务窗口在需求时段两端各多留的交接保护时间（s）
 
 
 # ===============================================================
@@ -149,9 +151,9 @@ def trip_profiles(ev, sites):
                     k = max(range(K), key=lambda kk: (reach[kk, p], -kk))
                 q = min(reach[k, p], p_end + 1) - 1      # 该点位覆盖 [p, q]
                 i, j = int(idx[p]), int(idx[q])
-                # 两端各向外延伸一个采样间隔：进出盲区与点位交接时，前后保障方式有重叠，采样点之间不留空档
-                a = T[i - 1] if i > 0 else T[i]
-                b = T[j + 1] if j + 1 < len(T) else T[j]
+                # 两端各向外延伸一个采样间隔再加交接保护时间：进出盲区与点位交接时前后保障方式有足够重叠
+                a = (T[i - 1] if i > 0 else T[i]) - HANDOVER_GUARD
+                b = (T[j + 1] if j + 1 < len(T) else T[j]) + HANDOVER_GUARD
                 plan.append((k, float(a), float(b), i, j))
                 p = q + 1
         # 同一点位相邻片段合并（间隔很短时视为同一需求）
@@ -290,9 +292,14 @@ def candidate_starts(state, profs, t0, S):
             for s in state:
                 if s["k"] == k:
                     cands.add(s["ws"] - a)
-    out = sorted(c for c in cands if c > t0 + 1e-6)[:80]
-    grid = [t0 + 120.0 * i for i in range(1, 150)]
+    out = sorted({snap(c) for c in cands if c > t0 + 1e-6})[:80]
+    grid = [snap(t0 + 120.0 * i) for i in range(1, 150)]
     return [t0] + sorted(set(out + grid))
+
+
+def snap(t):
+    """开始时刻取 0.1 s 整倍数（向后取整），使提交表中的时刻与方案内部时刻完全一致"""
+    return math.ceil(round(t * 10.0, 6)) / 10.0
 
 
 # ===============================================================
@@ -319,7 +326,7 @@ def joint_schedule(sol, sites, W=None, want_detail=False):
         g = ev["g"]
         u = min((x for x, gg in DRONES if gg == g), key=lambda x: (drone_free[x], x))
         b = min((x for x in batt_ready if x.startswith(g + "-")), key=lambda x: (batt_ready[x], x))
-        t0 = max(drone_free[u], batt_ready[b])
+        t0 = snap(max(drone_free[u], batt_ready[b]))
         start, assign = t0, []
         if profs:
             done = None
@@ -611,66 +618,152 @@ def phase_list(ev):
     return out
 
 
-def verify(info, dt=1.0):
+def _bisect(f, lo, hi, n=16):
+    """f(lo) 与 f(hi) 取值不同，二分定位跳变时刻（精度 (hi-lo)/2^n）；返回 (f 仍为 f(lo) 的最后时刻, 跳变后时刻)"""
+    v = f(lo)
+    for _ in range(n):
+        mid = 0.5 * (lo + hi)
+        if f(mid) == v:
+            lo = mid
+        else:
+            hi = mid
+    return lo, hi
+
+
+def verify(info, dt=0.1, scan=3.0):
     """
-    逐秒复核：对每架运输机的每个通信阶段按 1 s 插值三维位置，用精确链路判定确定保障方式：
-      直连可用 → 直连；否则在“已建链且处于服务窗口”的中继中选接入可用者（优先沿用当前中继，
-      保证任一时刻只由一架中继保障）；都不满足 → 中断。结果同时写入 p["comm_rows"] 供输出。
+    精确复核：对每架运输机从起飞到降落按 dt=0.1 s（绝对时刻整倍数）插值三维位置，用精确链路判定。
+    保障方式采用“保持优先”规则：当前方式（直连或某一架中继）只要仍可用就继续沿用，失效时才切换
+    （优先切回直连，其次选接入可用的在岗中继），任一时刻只由 G01 或一架中继保障，且避免频繁乒乓切换。
+    切换处用二分法求出旧方式失效时刻与新方式连续可用的起点（向前最多追溯 scan 秒），
+    把切换点放在两者同时可用区间的中点（取 0.01 s 整倍数），因此表中每一行在其整个时段内都成立，
+    而不只是在采样点上成立；若两者之间确有空档，则按空档实际长度计为中断。结果写入 p["comm_rows"]。
     """
     S = info["S"]
-    total = relay_sec = direct_sec = bad = 0
+    by_uid = {s["uid"]: s for s in info["state"]}
+    total = relay_sec = direct_sec = bad = 0.0
     bad_list = []
+    n_switch = 0
+    min_overlap = float("inf")
+    tight = []
     for p in info["plan"]:
         ev = p["ev"]
         kf = trip_track(ev)
-        rows = []
-        cur = None
-        for lab, a, b in phase_list(ev):
-            if b - a < 1e-9:
+        st = p["start"]
+        tid = p.get("tid", p["idx"])
+        phases = [(lab, st + a, st + b) for lab, a, b in phase_list(ev) if b - a > 1e-9]
+        A0, B1 = phases[0][1], phases[-1][2]
+
+        def valid(md, t):
+            if md == -2:
+                return False
+            q = tuple(float(np.interp(t - st, kf[:, 0], kf[:, c])) for c in (1, 2, 3))
+            if md == -1:
+                return link_ok(q, G01_POS, "direct")
+            s = by_uid[md]
+            return s["ws"] - 1e-9 <= t <= s["we"] + 1e-9 and link_ok(q, S[s["k"]]["pos"], "access")
+
+        k0, k1 = math.ceil(round(A0 / dt, 6)), math.floor(round(B1 / dt, 6))
+        ts = np.unique(np.concatenate([[A0, B1], [x for _, x, y in phases], [y for _, x, y in phases],
+                                       np.round(np.arange(k0, k1 + 1) * dt, 6)]))
+        ts = ts[(ts >= A0 - 1e-9) & (ts <= B1 + 1e-9)]
+        ts = ts[np.concatenate([[True], np.diff(ts) > 1e-6])]
+        pos = np.column_stack([np.interp(ts - st, kf[:, 0], kf[:, c]) for c in (1, 2, 3)])
+        dok = comm_geo.link_ok_many(G01_POS, pos, "direct")
+        acc = {}
+        for s in sorted(info["state"], key=lambda s: s["uid"]):
+            win = (ts >= s["ws"] - 1e-9) & (ts <= s["we"] + 1e-9)
+            if win.any():
+                m = np.zeros(len(ts), bool)
+                m[win] = comm_geo.link_ok_many(S[s["k"]]["pos"], pos[win], "access")
+                if m.any():
+                    acc[s["uid"]] = m
+
+        def ok_at(md, q):
+            return bool(dok[q]) if md == -1 else (md >= 0 and md in acc and bool(acc[md][q]))
+
+        mode, cur = [], None
+        for q in range(len(ts)):
+            if cur is not None and ok_at(cur, q):
+                md = cur
+            elif dok[q]:
+                md = -1
+            else:
+                md = next((u for u, m in acc.items() if m[q]), -2)
+            cur = md
+            mode.append(md)
+        runs = []
+        for q, md in enumerate(mode):
+            if runs and runs[-1][0] == md:
+                runs[-1][2] = q
+            else:
+                runs.append([md, q, q])
+        segs, t_prev = [], A0
+        for r_i, (X, q0, q1) in enumerate(runs):
+            if r_i + 1 == len(runs):
+                segs.append((t_prev, B1, X))
+                break
+            Y = runs[r_i + 1][0]
+            ta, tb = ts[q1], ts[q1 + 1]
+            if X == -2:                                 # 中断结束：新方式首次可用的精确时刻
+                y_beg = _bisect(lambda t: valid(Y, t), ta, tb)[1] if not valid(Y, ta) else ta
+                segs.append((t_prev, y_beg, -2))
+                t_prev = y_beg
                 continue
-            ts = np.unique(np.concatenate([np.arange(a, b, dt), [b]]))
-            pos = np.column_stack([np.interp(ts, kf[:, 0], kf[:, c]) for c in (1, 2, 3)])
-            dok = comm_geo.link_ok_many(G01_POS, pos, "direct")
-            tab = p["start"] + ts
-            rel = {}
-            for s in info["state"]:
-                act = (tab >= s["ws"] - 1e-6) & (tab <= s["we"] + 1e-6) & ~dok
-                if act.any():
-                    m = np.zeros(len(ts), bool)
-                    m[act] = comm_geo.link_ok_many(S[s["k"]]["pos"], pos[act], "access")
-                    if m.any():
-                        rel[s["uid"]] = m
-            mode = []
-            for q in range(len(ts)):
-                if dok[q]:
-                    md = -1
-                elif cur in rel and rel[cur][q]:
-                    md = cur
+            x_end = tb if valid(X, tb) else _bisect(lambda t: valid(X, t), ta, tb)[0]
+            if Y == -2:
+                segs.append((t_prev, x_end, X))
+                t_prev = x_end
+                continue
+            lim = max(t_prev, x_end - scan)
+            qq = q1 + 1
+            while qq - 1 >= 0 and ts[qq - 1] >= lim - 1e-9 and ok_at(Y, qq - 1):
+                qq -= 1
+            if qq - 1 >= 0 and ts[qq - 1] >= lim - 1e-9:
+                y_beg = _bisect(lambda t: valid(Y, t), ts[qq - 1], ts[qq])[1]
+            else:
+                y_beg = max(ts[qq], lim)
+            if y_beg <= x_end:
+                n_switch += 1
+                ov = x_end - y_beg
+                min_overlap = min(min_overlap, ov)
+                if ov < 0.5:
+                    tight.append((tid, round(ta, 2), X, Y, round(ov, 4)))
+                mid = 0.5 * (y_beg + x_end)
+                cut = round(mid, 2)
+                if not (y_beg <= cut <= x_end):
+                    cut = mid
+                segs.append((t_prev, cut, X))
+                t_prev = cut
+            else:
+                segs.append((t_prev, x_end, X))
+                segs.append((x_end, y_beg, -2))
+                t_prev = y_beg
+        rows = []
+        for a, b, md in segs:
+            for lab, pa, pb in phases:
+                lo, hi = max(a, pa), min(b, pb)
+                if hi - lo < 1e-9:
+                    continue
+                if rows and rows[-1][2] == lab and rows[-1][3] == md and abs(rows[-1][1] - lo) < 1e-9:
+                    rows[-1][1] = hi
                 else:
-                    md = next((u for u, m in rel.items() if m[q]), -2)
-                if md >= 0:
-                    cur = md
-                mode.append(md)
-            n = len(ts) - 1 if len(ts) > 1 else 1
-            for q in range(n):
-                t_a, t_b = tab[q], tab[min(q + 1, len(ts) - 1)]
-                if rows and rows[-1][2] == lab and rows[-1][3] == mode[q]:
-                    rows[-1][1] = t_b
-                else:
-                    rows.append([t_a, t_b, lab, mode[q]])
-                span = t_b - t_a
-                total += span
-                if mode[q] == -1:
-                    direct_sec += span
-                elif mode[q] >= 0:
-                    relay_sec += span
-                else:
-                    bad += span
-                    bad_list.append((p.get("tid", p["idx"]), lab, round(t_a, 1)))
+                    rows.append([lo, hi, lab, md])
+        for t_a, t_b, lab, md in rows:
+            span = t_b - t_a
+            total += span
+            if md == -1:
+                direct_sec += span
+            elif md >= 0:
+                relay_sec += span
+            else:
+                bad += span
+                bad_list.append((tid, lab, round(t_a, 2)))
         p["comm_rows"] = rows
     back_ok = all(link_ok(S[s["k"]]["pos"], G01_POS, "back") for s in info["state"])
     return {"total_s": total, "direct_s": direct_sec, "relay_s": relay_sec, "outage_s": bad,
-            "bad_trips": bad_list, "backhaul_ok": back_ok}
+            "bad_trips": bad_list, "backhaul_ok": back_ok, "switches": n_switch,
+            "min_overlap_s": min_overlap if n_switch else 0.0, "tight": tight}
 
 
 PH_CODE = {"爬升": 0, "巡航": 1, "下降": 2}
@@ -752,9 +845,9 @@ def relay_rows(info):
         l, r, e, soc, c = s["_d"]
         pos = S[s["k"]]["pos"]
         rows.append({"中继架次编号": s["rid"], "中继无人机编号": s["r"], "能源组件编号": s["m"],
-                     "开始时刻（s）": round(l, 1), "悬停经度（°）": round(pos[0], 6), "悬停纬度（°）": round(pos[1], 6),
-                     "悬停海拔（m）": round(pos[2], 1), "建链完成时刻（s）": round(s["ws"], 1),
-                     "服务结束时刻（s）": round(s["we"], 1), "返回O01时刻（s）": round(r, 1),
+                     "开始时刻（s）": round(l, 2), "悬停经度（°）": round(pos[0], 6), "悬停纬度（°）": round(pos[1], 6),
+                     "悬停海拔（m）": round(pos[2], 1), "建链完成时刻（s）": round(s["ws"], 2),
+                     "服务结束时刻（s）": round(s["we"], 2), "返回O01时刻（s）": round(r, 2),
                      "架次能耗（kWh）": round(e, 4), "悬停点位": f"P{s['k'] + 1}",
                      "悬停离地高度(m)": round(pos[2] - float(dem_at(pos[0], pos[1])), 1),
                      "返航SOC(%)": round(soc * 100, 2), "组件充满时刻(s)": round(c, 1)})
@@ -785,8 +878,8 @@ def transport_rows(info):
                               "是否准时": "是" if t <= bx["due"] + 1e-6 else "否",
                               "延误(s)": round(max(0, t - bx["due"]), 1)})
         for t_a, t_b, lab, m in p["comm_rows"]:
-            comm.append({"运输架次编号": p["tid"], "通信阶段": lab, "开始时刻（s）": round(t_a, 1),
-                         "结束时刻（s）": round(t_b, 1),
+            comm.append({"运输架次编号": p["tid"], "通信阶段": lab, "开始时刻（s）": round(t_a, 2),
+                         "结束时刻（s）": round(t_b, 2),
                          "保障方式": {-1: "直连G01", -2: "中断"}.get(m, "中继"),
                          "中继架次编号": by_uid[m]["rid"] if m >= 0 else ""})
     boxes.sort(key=lambda r: r["货箱编号"])
@@ -847,9 +940,10 @@ def check_rows(info, ver):
     checks.append(("悬停点位于DEM范围内、离地高度≤300m", inside and all(a <= R["max_agl"] + 1e-6 for a in agl),
                    f"离地高度 {min(agl):.0f}~{max(agl):.0f} m" if agl else "-"))
     checks.append(("中继回传链路（中继—G01）可用", ver["backhaul_ok"], ""))
-    checks.append(("逐秒复核：运输机飞行与投送全程通信不中断", ver["outage_s"] == 0,
-                   f"飞行+投送共 {ver['total_s']:.0f} s：直连 {ver['direct_s']:.0f} s，"
-                   f"中继 {ver['relay_s']:.0f} s，中断 {ver['outage_s']:.0f} s"))
+    checks.append(("0.1 s 精细复核：运输机飞行与投送全程通信不中断", ver["outage_s"] <= 1e-9,
+                   f"飞行+投送共 {ver['total_s']:.1f} s：直连 {ver['direct_s']:.1f} s，"
+                   f"中继 {ver['relay_s']:.1f} s，中断 {ver['outage_s']:.2f} s；"
+                   f"保障方式切换 {ver['switches']} 次，切换处新旧方式同时可用的最短重叠 {ver['min_overlap_s']:.3f} s"))
     return pd.DataFrame(checks, columns=["检验内容", "是否通过", "说明"])
 
 
@@ -1065,12 +1159,29 @@ if __name__ == "__main__":
             sol, sites, c = s3, st3, c3
             print(f"   情景解接力修正得到更优主方案：目标 {c:.2f}")
 
+    # ---- 深度精修：迭代低温重启退火（连续 6 轮无改进停止）+ 更小步长（约 14 m）点位精修 ----
+    print("\n===== 深度精修 =====")
+    fail, sd, t_d = 0, 100, time.time()
+    while fail < 6:
+        sd += 1
+        T0 = (1.5, 3.0, 6.0)[sd % 3]
+        s2, st2, c2 = joint_anneal(sol, sites, iters=12000, T0=T0, seed=sd, verbose=False, restarts=2)
+        s2, st2, c2 = polish(s2, st2, rounds=2, tries=2500)
+        if c2 < c - 1e-6:
+            sol, sites, c, fail = s2, st2, c2, 0
+            print(f"   低温重启 种子 {sd}（初温 {T0}）：目标 {c:.2f}，用时 {time.time() - t_d:.0f}s")
+        else:
+            fail += 1
+    sites, c = refine_sites(sol, sites, steps=(0.0005, 0.00025, 0.000125))
+    sol, sites, c = polish(sol, sites, rounds=2, tries=3000)
+    print(f"   深度精修后目标 {c:.2f}")
+
     # ---- 闭环修正：逐秒复核 → 中断处局部加密采样 → 重新调度 + 爬山，直到全程无中断 ----
-    print("\n===== 逐秒复核闭环修正 =====")
+    print("\n===== 0.1 s 精细复核闭环修正 =====")
     for rnd in range(1, 9):
         c, info = evaluate(sol, sites, detail=True)
         ver = verify(info)
-        print(f"   第 {rnd} 轮：目标 {c:.2f}，通信中断 {ver['outage_s']:.0f} s")
+        print(f"   第 {rnd} 轮：目标 {c:.2f}，通信中断 {ver['outage_s']:.2f} s，切换 {ver['switches']} 次，最短重叠 {ver['min_overlap_s']:.3f} s")
         if ver["outage_s"] <= 1e-9:
             break
         n_need, n_add = augment(info, ver)
@@ -1085,7 +1196,7 @@ if __name__ == "__main__":
 
     df_relay = relay_rows(info)
     ver = verify(info)
-    print(f"最终逐秒复核：中断 {ver['outage_s']:.0f} s")
+    print(f"最终精细复核：中断 {ver['outage_s']:.2f} s，最短切换重叠 {ver['min_overlap_s']:.3f} s")
     df_trip, df_box, df_comm = transport_rows(info)
     df_res = resource_rows(info)
     df_chk = check_rows(info, ver)
